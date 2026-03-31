@@ -76,6 +76,22 @@ Key observations:
 
 ---
 
+## Plots
+
+### ROC Curve and Confusion Matrix
+![ROC and Confusion Matrix](images/fno_roc_confusion.png)
+
+- Shows class-wise separability and overall classification performance  
+- Confusion matrix highlights errors between substructure classes (especially sphere vs vortex)
+
+---
+
+### Training History
+![Training History](images/fno_history.png)
+
+- Training stabilizes after removal of aggressive augmentation  
+- Clean fine-tuning phase leads to consistent validation improvement  
+
 ## Training Strategy
 
 Training was performed in multiple controlled phases:
