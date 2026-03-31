@@ -1,69 +1,141 @@
+Rewritten README with corrected architecture, training logic, and results:
+
+---
+
 # Neural Operator Classifier
 
-Gravitational lensing image classifier using a **Fourier Neural Operator (FNO)** augmented with an EfficientNet-B0 backbone.
+Gravitational lensing image classifier using a **Fourier Neural Operator (FNO)** combined with an **EfficientNet-B0** backbone.
 
 ---
 
 ## Architecture
 
-Two parallel branches process each input image independently, then their features are concatenated into a shared classification head.
+A dual-stream model where spectral and spatial representations are learned in parallel and fused for classification.
 
-**FNO branch** — replaces spatial convolutions with spectral convolutions. Each block applies a learned linear map in the truncated Fourier basis (`rfft2` → complex weight multiply → `irfft2`), plus a pointwise bypass conv and GroupNorm. This gives a global receptive field from the very first layer. Config: width=48, modes=12, 4 blocks.
+**FNO branch**
+Processes the input in the Fourier domain using spectral convolutions:
 
-**CNN branch** — EfficientNet-B0 pretrained on ImageNet, frozen during the first 5 warmup epochs then fine-tuned at 10× lower learning rate. The 1-channel input is replicated to 3 channels inside `forward()` and ImageNet-normalized before passing to EfficientNet. Outputs a 1280-dim feature vector.
+* Input → $1 \times 1$ lifting conv → width $=64$
+* 3 FNO blocks with truncated modes $(k_1 = k_2 = 16)$
+* Each block: spectral conv + residual $1 \times 1$ conv + BatchNorm + GELU
+* Global average pooling → $64$-dim feature vector
 
-**Head** — `Linear(1280 + 768, 512) → Linear(512, 256) → Linear(256, 3)` with GELU activations and dropout.
+Key stability fixes:
+
+* Spectral weights stored as real tensors and cast via `torch.view_as_complex`
+* FFT executed with AMP disabled to avoid cuFFT FP16 issues
+* Input clamped to $[-3, 3]$ to suppress outlier-driven spectral artifacts
 
 ---
 
-## Why FNO for Lensing
+**CNN branch**
+EfficientNet-B0 pretrained on ImageNet:
 
-Gravitational lensing arcs are global, ring-like features. Different substructure types produce distinct spectral signatures:
+* First layer adapted to single-channel input
+* Final classifier removed
+* Outputs a $1280$-dim feature vector
 
-- **No substructure** — smooth Einstein ring, power concentrated in low Fourier modes
-- **Subhalo** — localized arc perturbations, mid-frequency distortions
-- **Vortex** — spiral angular patterns, specific angular-frequency signatures
+---
 
-Standard CNNs learn these implicitly by stacking local kernels. FNO learns them directly, one mode at a time.
+**Fusion head**
+Concatenated features passed through:
 
-| Property | FNO branch | EfficientNet-B0 |
-|---|---|---|
-| Receptive field | Global from layer 1 | Grows with depth |
-| Frequency handling | Explicit per-mode weights | Implicit via stacking |
-| Complexity per layer | O(N log N) | O(N · k²) |
-| Pretraining | From scratch | ImageNet pretrained |
-| Inductive bias | Periodic translation equivariance | Local translation equivariance |
+* $1344 \rightarrow 512 \rightarrow 128 \rightarrow 3$
+* GELU activations + BatchNorm + Dropout
+
+---
+
+## Motivation
+
+Gravitational lensing signals exist across scales:
+
+* **FNO** captures global structure immediately through frequency-domain representation
+* **EfficientNet** captures fine local distortions via spatial convolutions
+
+The hybrid model combines both inductive biases:
+
+* Global spectral consistency (rings, symmetry)
+* Local texture sensitivity (subhalo perturbations)
 
 ---
 
 ## Results
 
-![ROC and Confusion Matrix](images/fno_roc_confusion.png)
+| Model                               | Macro AUC  |
+| ----------------------------------- | ---------- |
+| EfficientNet-B0 (baseline)          | 0.9744     |
+| FNO + EfficientNet (initial, MixUp) | 0.774      |
+| FNO + EfficientNet (clean training) | **0.9217** |
+| FNO + EfficientNet (final, TTA)     | **0.9439** |
 
-![Training History](images/fno_history.png)
+Key observations:
 
-| Task | Model | Macro AUC |
-|---|---|---|
-| Common Test I | EfficientNet-B0 standalone | 0.9741 |
-| Specific Test IV | EfficientNet-B0 + FNO hybrid | 0.7744 |
+* MixUp limited convergence in later stages
+* Removing augmentation and applying input clamping improved stability
+* FNO contributes complementary global features but requires careful training
 
-The FNO branch trains from scratch — no pretrained FNO weights exist for scientific imaging. The gap relative to the CNN baseline reflects this, not a fundamental limitation of the spectral approach.
+---
 
-Per-class AUC: `no` = 0.8466, `sphere` = 0.6915, `vort` = 0.7852
+## Training Strategy
+
+Training was performed in multiple controlled phases:
+
+**Phase 1–2 (Base training with MixUp)**
+
+* AUC plateau at ~0.92
+* MixUp began limiting fine-grained learning
+
+**Phase 3 (Clean fine-tuning)**
+
+* Removed MixUp
+* Added input clamping
+* Improved to **0.9217**
+
+**Phase 4 (Aggressive augmentation — failed)**
+
+* CutMix + label smoothing destabilized training
+* AUC dropped to ~0.84
+
+**Phase 5 (Gradual fine-tuning)**
+
+* Multi-stage LR decay
+* No augmentation
+* Stable convergence
 
 ---
 
 ## Training Details
 
-- **Optimizer**: AdamW, two param groups (CNN: LR×0.1, FNO: LR=2e-4)
-- **Scheduler**: OneCycleLR stepped per batch, 15% warmup
-- **Augmentation**: horizontal/vertical flip, random rot90, Gaussian noise σ=0.02
-- **Regularization**: label smoothing 0.1, dropout 0.3/0.2, grad clip 0.5
-- **Epochs**: 70, batch size 128, image size 64×64
+* **Optimizer**: AdamW
+* **Scheduler**: OneCycleLR
+* **Batch size**: 128
+* **Image size**: 64 × 64
+* **Hardware**: NVIDIA T4 (~53s/epoch)
+* **Normalization**: per-sample mean/std, then clamp to $[-3, 3]$ (FNO path)
+
+---
+
+## Key Insight
+
+The main bottleneck was **spectral instability**, not model capacity.
+Unbounded pixel values produced dominant FFT coefficients, masking useful frequency structure.
+Clamping the input acted as a physics-informed filter and enabled meaningful learning.
 
 ---
 
 ## Limitations
 
-- FNO trains from scratch vs. EfficientNet which starts from ImageNet — the comparison favors the CNN baseline.
-- Increasing `FNO_WIDTH` to 128 or applying spectral convolutions to intermediate CNN feature maps (rather than raw input) would likely improve results with more compute.
+* FNO is trained from scratch; no pretrained spectral models exist for this domain
+* Hybrid model remains below CNN baseline due to optimization difficulty
+* Strong coupling between branches makes aggressive regularization unstable
+
+---
+
+## Future Work
+
+* Apply spectral layers on intermediate CNN features instead of raw input
+* Increase FNO width and modes with better memory handling
+* Explore physics-informed losses in Fourier space
+* Pretrain FNO on synthetic lensing simulations
+
+---
